@@ -15,3 +15,6 @@ local.properties
 GPUCache/
 /release/
 /.kotlin/
+
+# Orchestrator/coder working specs (internal, not upstream)
+/memory/

@@ -673,4 +673,27 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
     <string name="pref_mpris_volume_control_key" translatable="false">mpris_volume_control_enabled</string>
     <string name="pref_mpris_volume_control_title">Hardware volume keys</string>
     <string name="pref_mpris_volume_control_summary">Control the connected device\'s media volume using this phone\'s hardware buttons</string>
+
+    <!-- Camera plugin -->
+    <string name="cameraplugin_title">Camera as webcam</string>
+    <string name="cameraplugin_description">Share this device\'s camera with the connected computer</string>
+    <string name="cameraplugin_notification_title">Camera shared</string>
+    <string name="cameraplugin_notification_text">%1$s is using your camera</string>
+    <string name="cameraplugin_notification_stop">Stop sharing</string>
+    <string name="cameraplugin_share_button">Camera sharing</string>
+    <string name="cameraplugin_share_title">Share camera</string>
+    <string name="cameraplugin_share_camera">Camera</string>
+    <string name="cameraplugin_share_resolution">Resolution</string>
+    <string name="cameraplugin_share_rotation">Rotation</string>
+    <string name="cameraplugin_share_start">Start sharing</string>
+    <string name="cameraplugin_share_stop">Stop sharing</string>
+    <string name="cameraplugin_share_status_active">Sharing camera with the connected computer</string>
+    <string name="cameraplugin_share_status_active_device">Sharing camera with %1$s</string>
+    <string name="cameraplugin_share_status_idle">Not sharing</string>
+    <string name="cameraplugin_share_error_permission">Camera permission is required to share your camera</string>
+    <string name="cameraplugin_share_error_busy">Camera is already in use</string>
+    <string name="cameraplugin_share_error_no_cameras">No cameras found on this device</string>
+    <string name="cameraplugin_facing_back">Back</string>
+    <string name="cameraplugin_facing_front">Front</string>
+    <string name="cameraplugin_facing_external">External</string>
 </resources>

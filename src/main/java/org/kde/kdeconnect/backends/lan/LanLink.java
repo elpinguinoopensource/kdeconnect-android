@@ -204,6 +204,12 @@ public class LanLink extends BaseLink {
                 //Convert to SSL if needed
                 payloadSocket = SslHelper.convertToSslSocket(context, payloadSocket, getDeviceId(), true, false);
 
+                // Disable Nagle: the camera plugin streams live video over this
+                // socket in 4 KB chunks; the trailing partial write of each
+                // frame would otherwise wait up to ~40 ms for the previous
+                // ACK before going out. Harmless for bulk transfers too.
+                payloadSocket.setTcpNoDelay(true);
+
                 outputStream = payloadSocket.getOutputStream();
                 inputStream = np.getPayload().getInputStream();
 

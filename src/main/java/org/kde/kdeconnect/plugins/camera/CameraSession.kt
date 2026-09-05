@@ -1000,7 +1000,7 @@ internal fun selectAeFpsRange(available: Array<FpsRange>?, targetFps: Int): FpsR
  * Rules (deterministic):
  * 1. **Congested** (`paused` or `backlogBytes >= [HIGH_THRESHOLD_BYTES]`, i.e.
  *    ¾ of the desktop's 512 KB high-water mark): cut to −30%
- *    (`max(min, current * 7/10)`), at most once every [DOWN_COOLDOWN_TICKS]
+ *    (`max(effectiveMin, current * 7/10)`), at most once every [DOWN_COOLDOWN_TICKS]
  *    ticks so a single burst does not collapse the quality.
  * 2. **Comfortable** (`!paused` and `backlogBytes <= [LOW_THRESHOLD_BYTES]`):
  *    raise +10% (`min(max, current * 11/10)`), at most once every
@@ -1019,12 +1019,14 @@ internal fun selectAeFpsRange(available: Array<FpsRange>?, targetFps: Int): FpsR
  * @param initial Bitrate the encoder starts at (bps).
  * @param max Upper bound for increases (bps). Normally equals [initial]: the
  *   controller may only climb back toward what the host asked for.
- * @param min Lower bound for decreases (bps).
+ * @param min Requested lower bound for decreases (bps). Clamped internally to
+ *   never exceed [max] (see [effectiveMin]), so a host-negotiated bitrate below
+ *   the default floor is handled instead of throwing.
  */
 internal class AdaptiveBitrate(
     initial: Int,
     val max: Int,
-    val min: Int = 500_000,
+    min: Int = 500_000,
 ) {
     companion object {
         /** Minimum ticks between two bitrate decreases. */
@@ -1040,8 +1042,19 @@ internal class AdaptiveBitrate(
         const val LOW_THRESHOLD_BYTES = 65_536L
     }
 
+    /**
+     * Effective lower bound for decreases: the requested `min` floor clamped so
+     * it never exceeds [max]. The host may negotiate a bitrate below the default
+     * 500 kbps floor (the desktop UI's spinbox reaches 250 kbps and Android's
+     * `clampRequest` allows >= 100 kbps). Without this clamp, `coerceIn(min, max)`
+     * below would throw `IllegalArgumentException` (min > max) and tear down an
+     * otherwise-healthy session; here the floor simply collapses to the ceiling,
+     * pinning the bitrate at what was negotiated.
+     */
+    val effectiveMin: Int = minOf(min, max)
+
     /** Most recent bitrate decision, visible for tests and logs. */
-    var currentBitrate: Int = initial.coerceIn(min, max)
+    var currentBitrate: Int = initial.coerceIn(effectiveMin, max)
         private set
 
     private var ticks = 0
@@ -1058,7 +1071,7 @@ internal class AdaptiveBitrate(
         val target = if (paused || backlogBytes >= HIGH_THRESHOLD_BYTES) {
             // Congested: cut 30%, respecting the decrease cooldown.
             if (ticks - lastDecreaseTick < DOWN_COOLDOWN_TICKS) return null
-            maxOf(min, currentBitrate * 7 / 10)
+            maxOf(effectiveMin, currentBitrate * 7 / 10)
         } else if (backlogBytes <= LOW_THRESHOLD_BYTES) {
             // Comfortable: grow 10%, but slowly.
             if (ticks - lastIncreaseTick < UP_INTERVAL_TICKS) return null

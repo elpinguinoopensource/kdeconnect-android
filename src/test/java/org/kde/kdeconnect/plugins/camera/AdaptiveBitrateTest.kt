@@ -191,4 +191,29 @@ class AdaptiveBitrateTest {
         assertEquals(500_000, AdaptiveBitrate(initial = 100_000, max = 4_000_000, min = 500_000).currentBitrate)
         assertEquals(4_000_000, AdaptiveBitrate(initial = 9_000_000, max = 4_000_000).currentBitrate)
     }
+
+    // ── Floor above ceiling (host negotiated a low bitrate) ────────────
+
+    @Test
+    fun `min above max does not throw and pins bitrate at max`() {
+        // The desktop UI's bitrate spinbox reaches 250 kbps and Android's
+        // clampRequest allows >= 100 kbps, both below the 500 kbps default
+        // floor. The controller is built with max == initial, so min > max
+        // here; coerceIn(min, max) would throw IllegalArgumentException
+        // without the internal clamp.
+        val c = AdaptiveBitrate(initial = 250_000, max = 250_000)
+        assertEquals(250_000, c.effectiveMin)
+        assertEquals(250_000, c.currentBitrate)
+        // Congestion cannot push below the (collapsed) floor; it is already
+        // pinned at max, so the cut is a no-op and returns null.
+        assertNull(c.onStats(backlogBytes = high, paused = true))
+        assertEquals(250_000, c.currentBitrate)
+    }
+
+    @Test
+    fun `explicit min above max is clamped to max`() {
+        val c = AdaptiveBitrate(initial = 300_000, max = 300_000, min = 900_000)
+        assertEquals(300_000, c.effectiveMin)
+        assertEquals(300_000, c.currentBitrate)
+    }
 }

@@ -30,6 +30,9 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import org.kde.kdeconnect.Device
 import org.kde.kdeconnect.NetworkPacket
 import org.kde.kdeconnect_tp.R
@@ -937,5 +940,178 @@ class CameraPluginTest {
         assertEquals("Listener should have been notified with false", false, lastListenerValue)
 
         plugin.removeActiveListener(listener)
+    }
+
+
+    // ---- CAM-11: stale session callbacks must not tear down the live session ----
+
+    private fun singleCameraCatalog(): CameraCatalog = object : CameraCatalog {
+        override fun listCameras(): List<CameraDescription> = listOf(
+            CameraDescription(
+                id = "0",
+                facing = CameraProtocol.FACING_BACK,
+                hasFlash = true,
+                sizes = listOf(CameraSize(1280, 720, 30))
+            )
+        )
+    }
+
+    private fun sampleRequest() = CameraSession.Request(
+        cameraId = "0", width = 1280, height = 720, fps = 30,
+        bitrate = 4_000_000, rotationDegrees = 0,
+    )
+
+    /**
+     * A session's callbacks are delivered asynchronously from its own camera
+     * handler thread, so `onSessionStopped` for a superseded session can arrive
+     * after a newer session is already live.
+     *
+     * Regression test: the stale callback used to clear `session` and release
+     * the wake lock / foreground service unconditionally, tearing down the
+     * replacement session while its camera was still streaming.
+     */
+    @Test
+    fun staleSessionStoppedCallbackDoesNotTearDownLiveSession() {
+        plugin.catalogProvider = { singleCameraCatalog() }
+
+        // Sessions in creation order, each with the callbacks it was built with.
+        val sessions = Collections.synchronizedList(mutableListOf<CameraSession>())
+        val callbacks = Collections.synchronizedList(mutableListOf<CameraSession.Callbacks>())
+        plugin.sessionFactory = { _, _, cb ->
+            mockk<CameraSession>(relaxed = true).also {
+                sessions.add(it)
+                callbacks.add(cb)
+            }
+        }
+
+        val wakeCalls = Collections.synchronizedList(mutableListOf<Boolean>())
+        plugin.wakeLockController = { active -> wakeCalls.add(active) }
+
+        val serviceCalls = Collections.synchronizedList(mutableListOf<Boolean>())
+        plugin.sendCameraServiceIntent = { active -> serviceCalls.add(active) }
+
+        val listenerValues = Collections.synchronizedList(mutableListOf<Boolean>())
+        val listener: (Boolean) -> Unit = { active -> listenerValues.add(active) }
+        plugin.addActiveListener(listener)
+
+        every { device.sendPacket(any()) } returns Unit
+
+        // Session #1 goes live.
+        plugin.startSharing(sampleRequest())
+        Thread.sleep(200)
+        assertTrue("session #1 should be live", plugin.isSharing())
+
+        // Stop it and start a replacement before #1's async stop callback lands.
+        plugin.stopSession(userInitiated = false)
+        assertFalse("session should be detached by stopSession", plugin.isSharing())
+
+        plugin.startSharing(sampleRequest())
+        Thread.sleep(200)
+        assertTrue("session #2 should be live", plugin.isSharing())
+        assertEquals("two sessions should have been created", 2, sessions.size)
+
+        // The wake lock and foreground service belong to session #2 now.
+        assertEquals("wake lock should be held for session #2", true, wakeCalls.last())
+        assertEquals("service should be promoted for session #2", true, serviceCalls.last())
+        assertEquals("listeners should see session #2 as active", true, listenerValues.last())
+
+        // Now the stale callback from session #1 finally arrives.
+        callbacks[0].onSessionStopped()
+
+        assertTrue("stale onSessionStopped must not detach the live session", plugin.isSharing())
+        assertEquals(
+            "stale callback must not release the wake lock of the live session",
+            true, wakeCalls.last()
+        )
+        assertEquals(
+            "stale callback must not demote the foreground service of the live session",
+            true, serviceCalls.last()
+        )
+        assertEquals(
+            "stale callback must not notify listeners that the live session ended",
+            true, listenerValues.last()
+        )
+
+        plugin.removeActiveListener(listener)
+    }
+
+    /**
+     * Same guard, failure path: a late `onSessionFailed` from a superseded
+     * session must neither detach the live session nor report a bogus error to
+     * the desktop, which would make the UI show a working camera as broken.
+     */
+    @Test
+    fun staleSessionFailedCallbackDoesNotTearDownLiveSession() {
+        plugin.catalogProvider = { singleCameraCatalog() }
+
+        val callbacks = Collections.synchronizedList(mutableListOf<CameraSession.Callbacks>())
+        plugin.sessionFactory = { _, _, cb ->
+            mockk<CameraSession>(relaxed = true).also { callbacks.add(cb) }
+        }
+        plugin.sendCameraServiceIntent = { }
+        plugin.wakeLockController = { }
+
+        val packetSlots = Collections.synchronizedList(mutableListOf<NetworkPacket>())
+        every { device.sendPacket(capture(packetSlots)) } returns Unit
+
+        plugin.startSharing(sampleRequest())
+        Thread.sleep(200)
+        assertEquals("one session should have been created", 1, callbacks.size)
+
+        plugin.stopSession(userInitiated = false)
+        plugin.startSharing(sampleRequest())
+        Thread.sleep(200)
+        assertTrue("session #2 should be live", plugin.isSharing())
+
+        // Drop everything sent so far, then let the stale failure land.
+        packetSlots.clear()
+        callbacks[0].onSessionFailed(CameraError.DISCONNECTED)
+
+        assertTrue("stale onSessionFailed must not detach the live session", plugin.isSharing())
+        assertTrue(
+            "stale onSessionFailed must not send an error packet for the live session",
+            packetSlots.none { it.type == CameraProtocol.PACKET_TYPE_CAMERA_ERROR }
+        )
+    }
+
+    /**
+     * Concurrent START requests must never leave two sessions installed: the
+     * losers are stopped, and their late callbacks must not disturb the winner.
+     */
+    @Test
+    fun concurrentStartsInstallExactlyOneSession() {
+        plugin.catalogProvider = { singleCameraCatalog() }
+
+        val stopped = Collections.synchronizedSet(mutableSetOf<CameraSession>())
+        val entries = Collections.synchronizedList(
+            mutableListOf<Pair<CameraSession, CameraSession.Callbacks>>()
+        )
+        plugin.sessionFactory = { _, _, cb ->
+            val s = mockk<CameraSession>(relaxed = true) {
+                every { stop() } answers { stopped.add(this@mockk) }
+            }
+            entries.add(s to cb)
+            s
+        }
+        plugin.sendCameraServiceIntent = { }
+        plugin.wakeLockController = { }
+        every { device.sendPacket(any()) } returns Unit
+
+        val threads = (1..8).map { Thread { plugin.startSharing(sampleRequest()) } }
+        threads.forEach { it.start() }
+        threads.forEach { it.join(5_000) }
+        Thread.sleep(500)
+
+        assertTrue("exactly one session should remain installed", plugin.isSharing())
+        assertTrue("at least one session should have been created", entries.isNotEmpty())
+
+        // Every session that lost the race must have been stopped; the winner
+        // must not have been.
+        val winners = entries.map { it.first }.filter { it !in stopped }
+        assertEquals("exactly one session should have survived", 1, winners.size)
+
+        // Delivering every loser's late callback must not disturb the winner.
+        entries.forEach { (session, cb) -> if (session in stopped) cb.onSessionStopped() }
+        assertTrue("late loser callbacks must not detach the winning session", plugin.isSharing())
     }
 }

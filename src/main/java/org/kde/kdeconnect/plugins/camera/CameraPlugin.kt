@@ -16,6 +16,7 @@ import android.os.PowerManager
 import android.util.Log
 import androidx.core.content.ContextCompat
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicReference
 import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
@@ -195,24 +196,27 @@ class CameraPlugin : Plugin() {
 
         // Start session on a background thread
         ThreadHelper.execute {
+            // Identity of the session these callbacks belong to, filled in as
+            // soon as the session exists. The callbacks compare against it so a
+            // superseded session can never clear the live one (see
+            // detachSessionIfCurrent).
+            val selfRef = AtomicReference<CameraSession?>(null)
+
             val callbacks = object : CameraSession.Callbacks {
                 override fun onSessionFailed(error: CameraError) {
+                    if (!detachSessionIfCurrent(selfRef.get())) return
                     sendCameraError(error)
-                    synchronized(lock) { session = null }
-                    wakeLockController(false)
-                    sendCameraServiceIntent(false)
-                    notifyActiveListeners(false)
+                    teardownEndedSession()
                 }
 
                 override fun onSessionStopped() {
-                    synchronized(lock) { session = null }
-                    wakeLockController(false)
-                    sendCameraServiceIntent(false)
-                    notifyActiveListeners(false)
+                    if (!detachSessionIfCurrent(selfRef.get())) return
+                    teardownEndedSession()
                 }
             }
 
             val s = sessionFactory(device, req, callbacks)
+            selfRef.set(s)
             synchronized(lock) {
                 if (session != null) {
                     // Another session started while we were creating this one
@@ -225,6 +229,49 @@ class CameraPlugin : Plugin() {
             sendCameraServiceIntent(true)
             notifyActiveListeners(true)
             s.start()
+        }
+        return true
+    }
+
+    /**
+     * Release the resources held for a session that has just ended.
+     *
+     * Only called once [detachSessionIfCurrent] has confirmed the session was
+     * still the live one, so these never run against a session that has already
+     * been superseded or torn down by [stopSession].
+     */
+    private fun teardownEndedSession() {
+        wakeLockController(false)
+        sendCameraServiceIntent(false)
+        notifyActiveListeners(false)
+    }
+
+    /**
+     * Detach [session] and report whether it was still [expected].
+     *
+     * Session callbacks are asynchronous and can arrive long after the session
+     * they belong to has been superseded. The clearest case is a START race:
+     * the losing task calls `stop()` on its own session, and that session's
+     * `onSessionStopped` then runs on the camera handler thread — by which time
+     * the winner's session is live.
+     *
+     * Acting on such a stale callback would tear the live session down:
+     * `isSharing()` would report false while the camera kept streaming, the wake
+     * lock and the foreground service would be released mid-stream (on MIUI the
+     * radio then drops into power-save and the stream stalls), listeners would
+     * be told the camera is off, and the next START would be accepted — opening
+     * two concurrent sessions on one device, the exact conflict the busy guard
+     * exists to prevent.
+     *
+     * A null [expected] means the callback fired before its owner was recorded,
+     * so that session was never installed and owns no resources; it is reported
+     * as not current.
+     */
+    private fun detachSessionIfCurrent(expected: CameraSession?): Boolean {
+        if (expected == null) return false
+        synchronized(lock) {
+            if (session !== expected) return false
+            session = null
         }
         return true
     }

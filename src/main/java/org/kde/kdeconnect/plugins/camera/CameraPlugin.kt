@@ -120,6 +120,7 @@ class CameraPlugin : Plugin() {
             CameraProtocol.PACKET_TYPE_CAMERA_LIST,
             CameraProtocol.PACKET_TYPE_CAMERA_START,
             CameraProtocol.PACKET_TYPE_CAMERA_STOP,
+            CameraProtocol.PACKET_TYPE_CAMERA_STATS,
         )
 
     override val outgoingPacketTypes: Array<String>
@@ -141,6 +142,10 @@ class CameraPlugin : Plugin() {
             }
             CameraProtocol.PACKET_TYPE_CAMERA_STOP -> {
                 handleCameraStop()
+                true
+            }
+            CameraProtocol.PACKET_TYPE_CAMERA_STATS -> {
+                handleCameraStats(np)
                 true
             }
             else -> false
@@ -222,6 +227,21 @@ class CameraPlugin : Plugin() {
             s.start()
         }
         return true
+    }
+
+    /**
+     * Handle a `camera.stats` congestion report from the desktop.
+     *
+     * The body carries the desktop's pending ffmpeg write-queue size and whether
+     * its drain is paused at the high-water mark; both feed the phone-side
+     * adaptive bitrate controller. Missing keys read as "no congestion" (0 /
+     * false), so a malformed packet is harmless.
+     */
+    private fun handleCameraStats(np: NetworkPacket) {
+        val backlog = np.getInt(CameraProtocol.KEY_BACKLOG_BYTES, 0).toLong()
+        val paused = np.getBoolean(CameraProtocol.KEY_PAUSED, false)
+        val s = synchronized(lock) { session }
+        s?.onStats(backlog, paused)
     }
 
     /**

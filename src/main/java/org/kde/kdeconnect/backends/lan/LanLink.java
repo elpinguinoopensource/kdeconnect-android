@@ -214,7 +214,24 @@ public class LanLink extends BaseLink {
                 inputStream = np.getPayload().getInputStream();
 
                 Log.i("KDE/LanLink", "Beginning to send payload for " + np.getType());
-                byte[] buffer = new byte[4096];
+                // 64 KB pump buffer: fewer TLS records per video frame. A 1080p
+                // keyframe costs 12-25 SSL_write calls at 4 KB but only 1-2 at
+                // 64 KB, which cuts per-frame syscall/record-header overhead and
+                // the latency spike at the start of every IDR. Harmless for bulk
+                // file transfers (same total bytes, just fewer, larger writes).
+                //
+                // Coalescing note: each read() already returns one full buffer,
+                // and StreamedPayloadInputStream enqueues exactly one access unit
+                // per write(), so a single read() cannot return less than a whole
+                // chunk unless the consumer is keeping up (in which case there is
+                // nothing more to coalesce). Trying an extra read() to merge
+                // adjacent chunks would block, because this InputStream only
+                // returns -1 on end-of-stream, never "no data right now" — and
+                // available() is unusable here (SSLSocket reports 0 even with data
+                // pending in the SSL engine's internal buffer). True access-unit
+                // coalescing would need a dedicated binary channel with a
+                // non-blocking producer/consumer queue; out of scope.
+                byte[] buffer = new byte[64 * 1024];
                 int bytesRead;
                 long size = np.getPayloadSize();
                 long progress = 0;

@@ -58,6 +58,98 @@ internal object AnnexBUtils {
     }
 
     /**
+     * Compute how many bytes [toAnnexB] would prepend for the given CSD set:
+     * one Annex-B start code plus the blob for every raw CSD buffer, or just
+     * the blob for buffers that already carry start codes (vendor Annex-B
+     * mode). Returns 0 when no CSD should be prepended ([includeCsd] false,
+     * [csd] null/empty).
+     *
+     * This mirrors [toAnnexB]'s internal size calculation exactly, so callers
+     * (e.g. CameraSession's zero-copy fast path) can size their scratch buffer
+     * up front without copying the payload first. Note that [toAnnexB] still
+     * applies its own SPS-already-bundled check on the payload bytes; callers
+     * that want to skip the prefix entirely should use
+     * [firstNalIsSps] (ByteBuffer overload) instead of copying.
+     *
+     * @param csd list of CSD buffers (SPS, PPS); may be `null`
+     * @param includeCsd whether CSD should be prepended at all
+     * @param payload the Annex-B payload; used for the SPS-already-bundled
+     *   check, kept for signature symmetry (see [toAnnexB] which uses it)
+     * @return number of bytes [toAnnexB] would write before the payload start
+     *   code, or 0 when CSD must not be prepended
+     */
+    fun csdPrependSize(csd: List<ByteBuffer>?, includeCsd: Boolean, payload: ByteArray): Int {
+        val needCsd = includeCsd &&
+            csd != null &&
+            csd.isNotEmpty() &&
+            !bufferAlreadyContainsSps(payload)
+        return if (needCsd) csdPrependSize(csd) else 0
+    }
+
+    /**
+     * [csdPrependSize] variant that checks for a bundled SPS by peeking at the
+     * encoder output [buffer] directly (via [firstNalIsSps]) instead of a
+     * copied payload array — used by CameraSession's zero-copy fast path to
+     * size its scratch buffer without touching the payload bytes.
+     */
+    fun csdPrependSize(csd: List<ByteBuffer>?, includeCsd: Boolean, buffer: ByteBuffer): Int {
+        val needCsd = includeCsd &&
+            csd != null &&
+            csd.isNotEmpty() &&
+            !firstNalIsSps(buffer)
+        return if (needCsd) csdPrependSize(csd) else 0
+    }
+
+    /**
+     * Sum of the CSD bytes [toAnnexB] would prepend (start codes included),
+     * without any payload-based SPS check. This is the single source of truth
+     * for the size computation shared by [toAnnexB] and the public overload.
+     */
+    private fun csdPrependSize(csd: List<ByteBuffer>): Int {
+        var total = 0
+        for (csdBuf in csd) {
+            total += if (isByteBufferMode(csdBuf)) {
+                csdBuf.remaining() // already has start codes
+            } else {
+                START_CODE.size + csdBuf.remaining()
+            }
+        }
+        return total
+    }
+
+    /**
+     * Check whether the data in [buffer] (from its position to its limit)
+     * already starts with an SPS NAL (type 7), either raw or after a 4-byte
+     * Annex-B start code. Non-destructive: position and limit are restored.
+     *
+     * Lets CameraSession decide whether CSD prepending is needed by peeking
+     * at the encoder output buffer directly, without copying the payload.
+     */
+    fun firstNalIsSps(buffer: ByteBuffer): Boolean {
+        val n = buffer.remaining()
+        if (n < 5) return false
+        val pos = buffer.position()
+        val limit = buffer.limit()
+        return try {
+            // Absolute get() is index-based on the backing array or a
+            // bounds-checked access for direct buffers; it never moves
+            // position, so peeking the first 5 bytes is safe.
+            if (buffer.get(pos) == 0.toByte() &&
+                buffer.get(pos + 1) == 0.toByte() &&
+                buffer.get(pos + 2) == 0.toByte() &&
+                buffer.get(pos + 3) == 1.toByte()
+            ) {
+                (buffer.get(pos + 4).toInt() and 0x1F) == 7
+            } else {
+                (buffer.get(pos).toInt() and 0x1F) == 7
+            }
+        } finally {
+            buffer.position(pos)
+            buffer.limit(limit)
+        }
+    }
+
+    /**
      * Build a self-contained Annex-B access unit from a MediaCodec output
      * buffer and optional Codec-Specific Data (SPS/PPS).
      *
@@ -85,17 +177,11 @@ internal object AnnexBUtils {
             csd.isNotEmpty() &&
             !bufferAlreadyContainsSps(payload)
 
-        // Calculate total size
+        // Calculate total size (shared helper keeps this in sync with
+        // csdPrependSize() used by the zero-copy producer path)
         var totalSize = START_CODE.size + payloadBytes // start code + payload
         if (needCsd) {
-            for (csdBuf in csd!!) {
-                if (isByteBufferMode(csdBuf)) {
-                    // Already has start codes — just copy the raw bytes
-                    totalSize += csdBuf.remaining()
-                } else {
-                    totalSize += START_CODE.size + csdBuf.remaining()
-                }
-            }
+            totalSize += csdPrependSize(csd!!)
         }
 
         val result = ByteArray(totalSize)

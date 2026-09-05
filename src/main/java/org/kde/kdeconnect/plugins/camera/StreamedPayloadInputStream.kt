@@ -7,6 +7,7 @@
 package org.kde.kdeconnect.plugins.camera
 
 import java.io.InputStream
+import java.nio.ByteBuffer
 
 /**
  * An [InputStream] adapter that bridges an open-ended producer/consumer stream
@@ -41,6 +42,12 @@ import java.io.InputStream
  * Each [write] call carries one complete MediaCodec output buffer in Annex-B
  * form (keyframes include CSD), so drops always land on NAL-unit boundaries —
  * no partial-NAL corruption is possible.
+ *
+ * The [write] ByteBuffer overload is a zero-intermediate-copy fast path: it
+ * lets the producer hand over the encoder output buffer directly (plus an
+ * optional scratch prefix with the start code and CSD) so the queued chunk is
+ * built with a single allocation, skipping the Annex-B staging array the
+ * byte-array path would otherwise need.
  *
  * Diagnostic counters [droppedBytes] and [droppedChunks] track cumulative
  * drops and are never reset (even on [finish]/[close]).
@@ -129,6 +136,73 @@ class StreamedPayloadInputStream(
     fun write(data: ByteArray, offset: Int, length: Int): Int {
         if (finished || closed) return 0
 
+        val chunk = ByteArray(length)
+        System.arraycopy(data, offset, chunk, 0, length)
+        return enqueueChunk(chunk)
+    }
+
+    /**
+     * Producer side (fast path): enqueue one chunk built from [prefix] (first
+     * [prefixLen] bytes) followed by the remaining bytes of [src], using a
+     * **single** allocation for the queued chunk. Semantics are identical to
+     * [write] with a byte array: never blocks, drop-oldest backpressure, silent
+     * no-op after [finish]/[close].
+     *
+     * Designed for the MediaCodec callback: the encoder output [src] is handed
+     * over directly (no Annex-B staging copy in between), while the start
+     * code + CSD prefix comes from a reusable scratch array. [src] is consumed
+     * non-destructively — its position is restored after the copy, so callers
+     * may still use the buffer afterwards (MediaCodec reclaims it via
+     * releaseOutputBuffer).
+     *
+     * @param src payload buffer; its [ByteBuffer.remaining] bytes are appended
+     *   after the prefix. Position/limit are left unchanged.
+     * @param prefix optional leading bytes (e.g. Annex-B start code + CSD);
+     *   may be `null`.
+     * @param prefixLen number of bytes of [prefix] to take. Defaults to the
+     *   whole array. Ignored when [prefix] is `null`.
+     * @return number of chunks dropped to make room (0 when nothing was
+     *   dropped). See [write] for how callers use this.
+     */
+    @Synchronized
+    fun write(
+        src: ByteBuffer,
+        prefix: ByteArray? = null,
+        prefixLen: Int = prefix?.size ?: 0,
+    ): Int {
+        if (finished || closed) return 0
+
+        val payloadLen = src.remaining()
+        val effectivePrefix = if (prefix != null) prefixLen.coerceIn(0, prefix.size) else 0
+        val length = payloadLen + effectivePrefix
+
+        // One allocation for the whole chunk: prefix first, then the payload,
+        // read from src without disturbing its position.
+        val chunk = ByteArray(length)
+        if (effectivePrefix > 0) {
+            System.arraycopy(prefix!!, 0, chunk, 0, effectivePrefix)
+        }
+        if (payloadLen > 0) {
+            // Bulk relative get: reads exactly remaining() bytes from the
+            // current position and advances it; restore afterwards so the
+            // buffer stays non-destructive (same convention as AnnexBUtils).
+            val pos = src.position()
+            src.get(chunk, effectivePrefix, payloadLen)
+            src.position(pos)
+        }
+        return enqueueChunk(chunk)
+    }
+
+    /**
+     * Shared enqueue core for both [write] overloads. Applies the drop-oldest
+     * backpressure policy, then appends the pre-built [chunk] and wakes a
+     * blocked reader. Caller must hold the monitor and must have checked
+     * finished/closed already (re-checked here because the drop loop is a
+     * natural place for a future await to be introduced).
+     */
+    private fun enqueueChunk(chunk: ByteArray): Int {
+        val length = chunk.size
+
         // Drop-oldest: pop head chunks until the new chunk fits or only 1 remains.
         // A single oversized chunk into an EMPTY queue is still enqueued (deadlock avoidance).
         var dropped = 0
@@ -143,8 +217,6 @@ class StreamedPayloadInputStream(
         }
         if (closed) return 0
 
-        val chunk = ByteArray(length)
-        System.arraycopy(data, offset, chunk, 0, length)
         queue.addLast(chunk)
         queuedBytes += length
         (this as Object).notifyAll()

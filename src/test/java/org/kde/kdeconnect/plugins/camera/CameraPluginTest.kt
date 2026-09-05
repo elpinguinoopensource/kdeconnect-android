@@ -85,7 +85,8 @@ class CameraPluginTest {
         assertTrue(supported.contains(CameraProtocol.PACKET_TYPE_CAMERA_LIST))
         assertTrue(supported.contains(CameraProtocol.PACKET_TYPE_CAMERA_START))
         assertTrue(supported.contains(CameraProtocol.PACKET_TYPE_CAMERA_STOP))
-        assertEquals(3, supported.size)
+        assertTrue(supported.contains(CameraProtocol.PACKET_TYPE_CAMERA_STATS))
+        assertEquals(4, supported.size)
     }
 
     @Test

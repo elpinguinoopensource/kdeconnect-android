@@ -10,6 +10,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -482,6 +483,179 @@ class StreamedPayloadInputStreamTest {
         for (i in 0 until 400) assertEquals(0xDD, result[i].toInt() and 0xFF)
         // Next 400 = E
         for (i in 400 until 800) assertEquals(0xEE, result[i].toInt() and 0xFF)
+        stream.close()
+    }
+
+    // ---- ByteBuffer zero-copy fast-path tests (camera latency tuning) ----
+
+    /** Drain a finished stream into a byte array (read() until -1). */
+    private fun drain(stream: StreamedPayloadInputStream, expected: Int? = null): ByteArray {
+        val out = java.io.ByteArrayOutputStream(expected ?: 64)
+        val buf = ByteArray(997) // odd size: exercises partial chunk reads
+        while (true) {
+            val n = stream.read(buf, 0, buf.size)
+            if (n == -1) break
+            out.write(buf, 0, n)
+        }
+        return out.toByteArray()
+    }
+
+    @Test
+    fun writeByteBufferMatchesByteArrayPath() {
+        // Same logical chunk via both paths must produce byte-identical output.
+        val payload = ByteArray(500) { ((it * 7 + 3) and 0xFF).toByte() }
+        val prefix = byteArrayOf(0, 0, 0, 1, 0x67, 0x42, 0x1E)
+
+        // Reference: classic ByteArray path (prefix + payload concatenated).
+        val reference = StreamedPayloadInputStream()
+        val joined = prefix + payload
+        reference.write(joined, 0, joined.size)
+        reference.finish()
+
+        // Fast path: ByteBuffer payload + ByteArray prefix, one chunk.
+        val fast = StreamedPayloadInputStream()
+        val src = ByteBuffer.wrap(payload.copyOf())
+        val dropped = fast.write(src, prefix = prefix, prefixLen = prefix.size)
+        assertEquals(0, dropped)
+        fast.finish()
+
+        assertArrayEquals(drain(reference, joined.size), drain(fast, joined.size))
+        reference.close()
+        fast.close()
+
+        // And the no-prefix variant against a payload-only ByteArray write.
+        val reference2 = StreamedPayloadInputStream()
+        reference2.write(payload, 0, payload.size)
+        reference2.finish()
+
+        val fast2 = StreamedPayloadInputStream()
+        fast2.write(ByteBuffer.wrap(payload.copyOf()), prefix = null, prefixLen = 0)
+        fast2.finish()
+
+        assertArrayEquals(drain(reference2, payload.size), drain(fast2, payload.size))
+    }
+
+    @Test
+    fun writeByteBufferPartialPrefixHonorsPrefixLen() {
+        // prefixLen < prefix.size must take only the first prefixLen bytes.
+        val stream = StreamedPayloadInputStream()
+        val prefix = byteArrayOf(1, 2, 3, 4, 5, 6, 7, 8)
+        val payload = byteArrayOf(0x65, 0x11, 0x22)
+
+        stream.write(ByteBuffer.wrap(payload), prefix = prefix, prefixLen = 3)
+        stream.finish()
+
+        assertArrayEquals(
+            byteArrayOf(1, 2, 3, 0x65, 0x11, 0x22),
+            drain(stream, 6),
+        )
+        stream.close()
+    }
+
+    @Test
+    fun writeByteBufferRespectsSourcePositionAndLimit() {
+        // Only [position, limit) is read; both are left untouched.
+        val raw = byteArrayOf(0x55, 0x55, 0x01, 0x02, 0x03, 0x04, 0x77, 0x77)
+        val buf = ByteBuffer.wrap(raw)
+        buf.position(2)
+        buf.limit(6)
+
+        val stream = StreamedPayloadInputStream()
+        stream.write(buf, prefix = null, prefixLen = 0)
+        stream.finish()
+
+        assertArrayEquals(byteArrayOf(0x01, 0x02, 0x03, 0x04), drain(stream, 4))
+        assertEquals("position must not change", 2, buf.position())
+        assertEquals("limit must not change", 6, buf.limit())
+        stream.close()
+    }
+
+    @Test
+    fun writeByteBufferDropOldestMatchesByteArrayPath() {
+        // Identical backpressure behaviour: three 600-byte chunks into a
+        // 1000-byte buffer drop the oldest, counters and order included.
+        val maxBuf = 1000
+        val bbStream = StreamedPayloadInputStream(maxBufferedBytes = maxBuf)
+        val baStream = StreamedPayloadInputStream(maxBufferedBytes = maxBuf)
+
+        val chunkA = ByteArray(600) { 0x10 }
+        val chunkB = ByteArray(600) { 0x20 }
+        val chunkC = ByteArray(600) { 0x30 }
+
+        for (chunk in listOf(chunkA, chunkB, chunkC)) {
+            val droppedBa = baStream.write(chunk, 0, chunk.size)
+            val droppedBb = bbStream.write(
+                ByteBuffer.wrap(chunk.copyOf()),
+                prefix = null,
+                prefixLen = 0,
+            )
+            // Same drop decision on both paths, iteration by iteration.
+            assertEquals("drop count mismatch for chunk ${chunk[0]}", droppedBa, droppedBb)
+        }
+
+        assertEquals(baStream.droppedChunks, bbStream.droppedChunks)
+        assertEquals(baStream.droppedBytes, bbStream.droppedBytes)
+        assertEquals(1, bbStream.droppedChunks)
+        assertEquals(600L, bbStream.droppedBytes)
+
+        // Kept data must be B + C in order (newest suffix), same as ByteArray path.
+        baStream.finish()
+        bbStream.finish()
+        val expected = chunkB + chunkC
+        assertArrayEquals(expected, drain(baStream, expected.size))
+        assertArrayEquals(expected, drain(bbStream, expected.size))
+        baStream.close()
+        bbStream.close()
+    }
+
+    @Test
+    fun oversizedByteBufferChunkEnqueuedWhenQueueEmpty() {
+        // A chunk larger than maxBufferedBytes into an EMPTY queue is still
+        // enqueued (deadlock avoidance), exactly like the ByteArray path.
+        val maxBuf = 1024
+        val stream = StreamedPayloadInputStream(maxBufferedBytes = maxBuf)
+        val payload = ByteArray(maxBuf * 3) { (it and 0xFF).toByte() }
+        val prefix = byteArrayOf(0, 0, 0, 1)
+
+        val dropped = stream.write(ByteBuffer.wrap(payload), prefix = prefix, prefixLen = prefix.size)
+        assertEquals(0, dropped)
+        assertEquals(payload.size + prefix.size, stream.bufferedBytes)
+
+        stream.finish()
+        val out = drain(stream, payload.size + prefix.size)
+        assertArrayEquals(prefix + payload, out)
+        stream.close()
+    }
+
+    @Test
+    fun writeByteBufferAfterFinishOrCloseReturnsZero() {
+        // After finish(): silent no-op, returns 0, existing data readable.
+        val finished = StreamedPayloadInputStream()
+        finished.write(byteArrayOf(1, 2, 3), 0, 3)
+        finished.finish()
+        assertEquals(0, finished.write(ByteBuffer.wrap(byteArrayOf(4, 5, 6))))
+        assertEquals(3, finished.bufferedBytes)
+        assertArrayEquals(byteArrayOf(1, 2, 3), drain(finished, 3))
+        finished.close()
+
+        // After close(): silent no-op, buffer stays empty.
+        val closed = StreamedPayloadInputStream()
+        closed.write(byteArrayOf(1, 2, 3), 0, 3)
+        closed.close()
+        assertEquals(0, closed.write(ByteBuffer.wrap(byteArrayOf(4, 5, 6)), prefix = byteArrayOf(9), prefixLen = 1))
+        assertEquals(0, closed.bufferedBytes)
+    }
+
+    @Test
+    fun writeByteBufferEmptyPayloadWithPrefixEnqueuesPrefixOnly() {
+        // Edge case: remaining() == 0 (e.g. zero-length output buffer).
+        val stream = StreamedPayloadInputStream()
+        val prefix = byteArrayOf(0, 0, 0, 1)
+        val dropped = stream.write(ByteBuffer.allocate(0), prefix = prefix, prefixLen = prefix.size)
+        assertEquals(0, dropped)
+        assertEquals(4, stream.bufferedBytes)
+        stream.finish()
+        assertArrayEquals(prefix, drain(stream, 4))
         stream.close()
     }
 }

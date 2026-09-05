@@ -18,10 +18,12 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.util.Log
+import android.util.Range
 import org.kde.kdeconnect.Device
 import org.kde.kdeconnect.NetworkPacket
 import org.kde.kdeconnect.helpers.ThreadHelper.execute
@@ -71,8 +73,26 @@ class CameraSession(
     private val stopped = AtomicBoolean(false)
     private var csdBuffers: List<ByteBuffer>? = null
 
+    /**
+     * Frame rate actually negotiated for this session (min of the requested
+     * fps and the max the sensor supports at the chosen resolution). Assigned
+     * in startInternal() after resolveEffectiveParams(); read from the camera
+     * callback thread in createCaptureSession() to lock the AE target fps
+     * range, hence @Volatile.
+     */
+    @Volatile
+    private var effectiveFps: Int = 0
+
     // ── Watchdog state (accessed only from handler thread) ──────────────
     private val stallDetector = StallDetector()
+
+    /**
+     * Bitrate controller driven by desktop `camera.stats` congestion reports.
+     * Created in startInternal() right after the encoder is configured, and —
+     * like the watchdog — only touched from the handler thread: onStats() hops
+     * onto it with a post(), so no locking is needed.
+     */
+    private var bitrateController: AdaptiveBitrate? = null
 
     /** Last time an output buffer was produced. Initialised before codec.start(). */
     @Volatile
@@ -85,6 +105,19 @@ class CameraSession(
     /** Total bytes written to the stream since codec start. */
     @Volatile
     private var bytesOut = 0L
+
+    /**
+     * Reusable scratch buffer for the Annex-B prefix (start code + CSD) in
+     * onOutputBufferAvailable. Only the prefix lives here — the payload is
+     * copied straight from the MediaCodec output buffer into the queued chunk,
+     * so this stays tiny (a few hundred bytes) regardless of frame size.
+     *
+     * No lock needed: MediaCodec callbacks are dispatched exclusively on
+     * [handler] (see `setCallback(createCodecCallback(), handler)`), so this
+     * field is only ever touched by that one thread (releaseAll() also runs
+     * there).
+     */
+    private var scratch: ByteArray? = null
 
     /**
      * Timestamp (ns) of the last encoder keyframe request issued after a
@@ -113,7 +146,7 @@ class CameraSession(
         }
 
         if (stallDetector.shouldLogStats()) {
-            Log.i(TAG, "camera stream stats: frames=$framesOut bytes=$bytesOut buffered=$buffered")
+            Log.i(TAG, "camera stream stats: frames=$framesOut bytes=$bytesOut buffered=$buffered dropped=${s?.droppedChunks ?: 0}")
         }
 
         handler.postDelayed(watchdogRunnable, WATCHDOG_INTERVAL_MS)
@@ -175,6 +208,38 @@ class CameraSession(
                 callbacks.onSessionStopped()
             }
             handlerThread.quitSafely()
+        }
+    }
+
+    /**
+     * Desktop congestion feedback (see `kdeconnect.camera.stats`). Applies the
+     * adaptive-bitrate policy and, when it changes the target, pushes the new
+     * value to the encoder without restarting it.
+     *
+     * Safe to call from any thread; a no-op once the session is stopping or if
+     * the encoder is not up yet (stats arriving before startInternal() finished
+     * describe a backlog we did not create).
+     *
+     * @param backlogBytes bytes still pending in the desktop's ffmpeg write queue
+     * @param paused whether the desktop paused draining at its high-water mark
+     */
+    fun onStats(backlogBytes: Long, paused: Boolean) {
+        handler.post {
+            if (stopping.get()) return@post
+            val controller = bitrateController ?: return@post
+            val oldBitrate = controller.currentBitrate
+            val newBitrate = controller.onStats(backlogBytes, paused) ?: return@post
+            Log.i(TAG, "adaptive bitrate: $oldBitrate -> $newBitrate (backlog=$backlogBytes paused=$paused)")
+            // Some vendor HALs throw if setParameters() races a codec that is
+            // stopped/released; the controller already committed the new value,
+            // so a failure here only delays the change until the next stats tick.
+            try {
+                codec?.setParameters(
+                    Bundle().apply { putInt(MediaFormat.KEY_BIT_RATE, newBitrate) }
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to apply adaptive bitrate $newBitrate", e)
+            }
         }
     }
 
@@ -305,17 +370,22 @@ class CameraSession(
         }
         Log.i(TAG, "Camera ${request.cameraId} opened")
 
-        val (effectiveWidth, effectiveHeight, effectiveFps) = resolveEffectiveParams(cameraManager)
-        Log.i(TAG, "Effective params: ${effectiveWidth}x${effectiveHeight} @ ${effectiveFps}fps")
+        val (effectiveWidth, effectiveHeight, fps) = resolveEffectiveParams(cameraManager)
+        effectiveFps = fps
+        Log.i(TAG, "Effective params: ${effectiveWidth}x${effectiveHeight} @ ${fps}fps")
 
         try {
-            configureEncoder(effectiveWidth, effectiveHeight, effectiveFps)
+            configureEncoder(effectiveWidth, effectiveHeight, fps)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to configure encoder", e)
             releaseAll()
             postFailure(CameraError.UNSUPPORTED)
             return
         }
+
+        // Adaptive bitrate: starts at the negotiated bitrate and may only be
+        // turned down from there (max == initial), driven by desktop stats.
+        bitrateController = AdaptiveBitrate(initial = request.bitrate, max = request.bitrate)
 
         val surface = inputSurface!!
         try {
@@ -407,6 +477,13 @@ class CameraSession(
         return Triple(bestSize.width, bestSize.height, effectiveFps)
     }
 
+    /**
+     * Encoder hint combination for the configure() cascade, most to least
+     * aggressive. intraRefresh: distribute I-macroblocks over the GOP instead
+     * of full IDR spikes (API 34+) → smoother bitrate and steady cadence.
+     */
+    private data class Variant(val lowLatency: Boolean, val profile: Boolean, val intraRefresh: Boolean)
+
     private fun configureEncoder(width: Int, height: Int, fps: Int) {
         val mediaCodec = MediaCodec.createEncoderByType(MIME)
         codec = mediaCodec
@@ -415,8 +492,12 @@ class CameraSession(
         // (Qualcomm OMX on SM6125 / Redmi Note 9S) accept unknown MediaFormat
         // keys but then fail configure() with EINVAL (0xffffffea), so we
         // cascade down to a plain baseline format on rejection.
-        data class Variant(val lowLatency: Boolean, val profile: Boolean)
-        val variants = listOf(Variant(true, true), Variant(true, false), Variant(false, false))
+        val variants = listOf(
+            Variant(lowLatency = true, profile = true, intraRefresh = true),
+            Variant(lowLatency = true, profile = true, intraRefresh = false),
+            Variant(lowLatency = true, profile = false, intraRefresh = false),
+            Variant(lowLatency = false, profile = false, intraRefresh = false),
+        )
 
         // setCallback once: calling it a second time throws
         // "callback is already set!" on some devices. A failed configure()
@@ -429,17 +510,24 @@ class CameraSession(
         for (variant in variants) {
             try {
                 mediaCodec.configure(
-                    buildEncoderFormat(width, height, fps, variant.lowLatency, variant.profile),
+                    buildEncoderFormat(width, height, fps, variant),
                     null,
                     null,
                     MediaCodec.CONFIGURE_FLAG_ENCODE
                 )
                 configured = true
                 if (!variant.lowLatency) Log.i(TAG, "Encoder configured without low-latency hints (device rejected them)")
+                if (!variant.intraRefresh) Log.i(TAG, "Encoder configured without intra-refresh (device rejected it)")
                 break
             } catch (e: Exception) {
                 lastError = e
-                Log.w(TAG, "Encoder configure failed (lowLatency=${variant.lowLatency}, profile=${variant.profile}), retrying with fewer hints", e)
+                Log.w(
+                    TAG,
+                    "Encoder configure failed (lowLatency=${variant.lowLatency}, " +
+                        "profile=${variant.profile}, intraRefresh=${variant.intraRefresh}), " +
+                        "retrying with fewer hints",
+                    e
+                )
             }
         }
         if (!configured) {
@@ -450,7 +538,7 @@ class CameraSession(
         inputSurface = mediaCodec.createInputSurface()
     }
 
-    private fun buildEncoderFormat(width: Int, height: Int, fps: Int, withLowLatency: Boolean, withProfile: Boolean): MediaFormat =
+    private fun buildEncoderFormat(width: Int, height: Int, fps: Int, variant: Variant): MediaFormat =
         MediaFormat.createVideoFormat(MIME, width, height).apply {
             // REQUIRED for surface-input encoders: the Qualcomm HAL on
             // SM6125 (and others) rejects configure() with CodecException
@@ -467,13 +555,19 @@ class CameraSession(
             )
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             setInteger(MediaFormat.KEY_BIT_RATE, request.bitrate)
-            setLong(MediaFormat.KEY_I_FRAME_INTERVAL, 1L)
+
+            // Periodic IDR (1 s) keeps the host resynchronisable. Skipped when
+            // intra-refresh is active: intra-refresh replaces the periodic
+            // IDR spikes, and some HALs reject both keys set at once.
+            if (!variant.intraRefresh) {
+                setLong(MediaFormat.KEY_I_FRAME_INTERVAL, 1L)
+            }
 
             // Low-latency encode hints (this is a live webcam stream, not a
             // file): emit each frame with minimal internal buffering (API 30+)
             // and run the codec in realtime priority (API 31+). Optional keys:
             // configure() cascades without them on codecs that reject them.
-            if (withLowLatency) {
+            if (variant.lowLatency) {
                 if (Build.VERSION.SDK_INT >= 30) {
                     setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
                 }
@@ -491,7 +585,7 @@ class CameraSession(
                 }
             }
 
-            if (withProfile && Build.VERSION.SDK_INT >= 34) {
+            if (variant.profile && Build.VERSION.SDK_INT >= 34) {
                 setInteger(
                     MediaFormat.KEY_PROFILE,
                     MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
@@ -500,6 +594,15 @@ class CameraSession(
                     MediaFormat.KEY_LEVEL,
                     MediaCodecInfo.CodecProfileLevel.AVCLevel31
                 )
+            }
+
+            // Intra-refresh (API 34+): refresh macroblocks progressively so
+            // there are no full-IDR bitrate spikes — steadier output for the
+            // LAN stream. Period = fps → one full refresh per second, matching
+            // the previous 1 s IDR interval. Mutually exclusive with
+            // KEY_I_FRAME_INTERVAL (see above).
+            if (variant.intraRefresh && Build.VERSION.SDK_INT >= 34) {
+                setInteger(MediaFormat.KEY_INTRA_REFRESH_PERIOD, fps)
             }
         }
 
@@ -555,8 +658,65 @@ class CameraSession(
                     }
 
                     val isKeyFrame = info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
-                    val annexb = AnnexBUtils.toAnnexB(buf, csdBuffers, includeCsd = isKeyFrame)
-                    val droppedChunks = streamInstance.write(annexb, 0, annexb.size)
+
+                    // Zero-copy fast path: build the Annex-B prefix (start code
+                    // + CSD) in the reusable scratch array and hand the encoder
+                    // output ByteBuffer straight to the stream, which copies
+                    // prefix+payload into ONE freshly allocated chunk. This
+                    // removes the intermediate payload[] and result[] copies
+                    // AnnexBUtils.toAnnexB used to do per frame (less GC churn
+                    // on the big IDR allocations).
+                    val csdList = csdBuffers
+                    val csdLen = if (isKeyFrame) {
+                        AnnexBUtils.csdPrependSize(csdList, includeCsd = true, buffer = buf)
+                    } else {
+                        0
+                    }
+                    val payloadLen = buf.remaining()
+                    val droppedChunks: Int
+                    // Bytes of prefix actually written to scratch (0 when no CSD)
+                    var prefixLen = 0
+                    if (csdLen > 0) {
+                        val needed = AnnexBUtils.START_CODE.size + csdLen
+                        var s = scratch
+                        if (s == null || s.size < needed) s = ByteArray(needed).also { scratch = it }
+                        var pos = 0
+                        for (csdBuf in csdList!!) {
+                            if (AnnexBUtils.isByteBufferMode(csdBuf)) {
+                                // Vendor Annex-B CSD already carries its own start
+                                // codes — copy as-is (same rule as AnnexBUtils).
+                                val saved = csdBuf.position()
+                                val n = csdBuf.remaining()
+                                csdBuf.get(s, pos, n)
+                                csdBuf.position(saved)
+                                pos += n
+                            } else {
+                                System.arraycopy(AnnexBUtils.START_CODE, 0, s, pos, AnnexBUtils.START_CODE.size)
+                                pos += AnnexBUtils.START_CODE.size
+                                val saved = csdBuf.position()
+                                val n = csdBuf.remaining()
+                                csdBuf.get(s, pos, n)
+                                csdBuf.position(saved)
+                                pos += n
+                            }
+                        }
+                        // The payload itself is always preceded by a start code
+                        // (same layout as AnnexBUtils.toAnnexB: [CSD...] + SC + AU).
+                        System.arraycopy(AnnexBUtils.START_CODE, 0, s, pos, AnnexBUtils.START_CODE.size)
+                        pos += AnnexBUtils.START_CODE.size
+                        prefixLen = pos
+                        droppedChunks = streamInstance.write(buf, prefix = s, prefixLen = pos)
+                    } else {
+                        // P-frames, or keyframes whose payload already bundles
+                        // SPS/PPS: no CSD prefix, but the payload still needs
+                        // its Annex-B start code (constant array, no copy).
+                        prefixLen = AnnexBUtils.START_CODE.size
+                        droppedChunks = streamInstance.write(
+                            buf,
+                            prefix = AnnexBUtils.START_CODE,
+                            prefixLen = AnnexBUtils.START_CODE.size,
+                        )
+                    }
                     if (droppedChunks > 0) {
                         // Stale frames were dropped to keep latency bounded.
                         // Ask the encoder for an immediate keyframe so the host
@@ -579,7 +739,7 @@ class CameraSession(
                         }
                     }
                     framesOut++
-                    bytesOut += annexb.size
+                    bytesOut += prefixLen + payloadLen
                     stallDetector.resetBackpressure()
                 } catch (e: Exception) {
                     Log.e(TAG, "Error in onOutputBufferAvailable", e)
@@ -652,6 +812,31 @@ class CameraSession(
                                 CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
                             )
                         }
+
+                        // Lock the AE target fps range to the effective fps.
+                        // Without this, AE lengthens exposure in low light and
+                        // drops the framerate → the encoder gets bursty output
+                        // instead of a steady cadence. See selectAeFpsRange().
+                        val target = effectiveFps
+                        val availableRanges = chars.get(
+                            CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES
+                        )
+                        val candidates = availableRanges?.map {
+                            FpsRange(it.lower, it.upper)
+                        }?.toTypedArray()
+                        val chosen = selectAeFpsRange(candidates, target)
+                        if (chosen != null) {
+                            builder.set(
+                                CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                                Range(chosen.lower, chosen.upper)
+                            )
+                            Log.i(
+                                TAG,
+                                "AE target fps range locked to ${chosen.lower}..${chosen.upper} (target ${target}fps)"
+                            )
+                        } else {
+                            Log.i(TAG, "No eligible AE target fps range for ${target}fps, leaving AE range unset")
+                        }
                     }
                     builder.set(
                         CaptureRequest.CONTROL_AE_MODE,
@@ -690,6 +875,8 @@ class CameraSession(
 
     private fun releaseAll() {
         handler.removeCallbacks(watchdogRunnable)
+        // The encoder is gone: stop honouring stats until a new session starts.
+        bitrateController = null
         synchronized(resourceLock) {
         // 1. Codec: signal end of stream, stop, release
         codec?.let { c ->
@@ -753,6 +940,142 @@ class CameraSession(
         }
         stream = null
         }
+    }
+}
+
+/**
+ * Camera AE target fps-range candidate, modeled as a plain value type so the
+ * selection logic is unit-testable on the JVM (android.util.Range is not on
+ * the unit-test classpath without Robolectric). Mapped to android.util.Range
+ * only at the point of use in createCaptureSession().
+ */
+internal data class FpsRange(val lower: Int, val upper: Int)
+
+/**
+ * Pick the CONTROL_AE_TARGET_FPS_RANGE the capture request should lock to.
+ *
+ * Rationale: with AE free to choose, the HAL lengthens the exposure time in
+ * dark scenes and silently drops the framerate to keep the picture bright —
+ * the encoder then receives frames in irregular bursts instead of a steady
+ * cadence (buffered B-frames/skip logic aside, the host sees jitter). Locking
+ * the AE to a range whose upper bound covers our target fps keeps the capture
+ * cadence steady; the picture may get noisier in low light, which is the
+ * correct trade-off for a live webcam.
+ *
+ * Selection rules (most to least preferred):
+ * 1. An exact fixed range (lower == upper == target) wins immediately.
+ * 2. Otherwise, among ranges that cover the target (upper >= target), prefer
+ *    the one whose lower bound is closest to the target (minimizes
+ *    target - lower), then the narrowest band (minimizes upper - lower).
+ *    A higher lower bound means the HAL is guaranteed to sustain more fps,
+ *    and a narrower band gives the AE less room to slow the cadence down.
+ * 3. No eligible range (empty/null list, or no upper >= target) → return
+ *    null and leave the AE range unset (previous behaviour).
+ */
+internal fun selectAeFpsRange(available: Array<FpsRange>?, targetFps: Int): FpsRange? {
+    if (available.isNullOrEmpty() || targetFps <= 0) return null
+
+    // Rule 1: exact fixed range.
+    available.firstOrNull { it.lower == targetFps && it.upper == targetFps }?.let { return it }
+
+    // Rule 2: closest lower bound below target, then narrowest band.
+    return available
+        .filter { it.upper >= targetFps }
+        .minWithOrNull(
+            compareBy<FpsRange> { targetFps - it.lower }
+                .thenBy { it.upper - it.lower }
+        )
+    // Rule 3 is implicit: filter yields nothing → minWithOrNull returns null.
+}
+
+/**
+ * Pure-JVM adaptive bitrate controller for camera streaming.
+ *
+ * Consumes desktop congestion stats (`kdeconnect.camera.stats`, ~every 2 s)
+ * and decides whether the encoder bitrate should change BEFORE drops happen —
+ * degraded-but-moving video beats a frozen picture. Stateless about clocks:
+ * every call to [onStats] is one "tick", so the cadence is whatever the
+ * desktop timer provides.
+ *
+ * Rules (deterministic):
+ * 1. **Congested** (`paused` or `backlogBytes >= [HIGH_THRESHOLD_BYTES]`, i.e.
+ *    ¾ of the desktop's 512 KB high-water mark): cut to −30%
+ *    (`max(min, current * 7/10)`), at most once every [DOWN_COOLDOWN_TICKS]
+ *    ticks so a single burst does not collapse the quality.
+ * 2. **Comfortable** (`!paused` and `backlogBytes <= [LOW_THRESHOLD_BYTES]`):
+ *    raise +10% (`min(max, current * 11/10)`), at most once every
+ *    [UP_INTERVAL_TICKS] ticks — recovery is deliberately much slower than
+ *    the reaction.
+ * 3. **Dead zone** (in between): hold, return null.
+ *
+ * A tick that changes the bitrate counts as the reference for the next
+ * cooldown/up-interval window. Returns the new bitrate only when it differs
+ * from the current one (clamping at min/max can make a "rule fired" tick a
+ * no-op).
+ *
+ * Thread safety: NOT thread-safe — drive it from a single thread (the session
+ * handler), like [StallDetector].
+ *
+ * @param initial Bitrate the encoder starts at (bps).
+ * @param max Upper bound for increases (bps). Normally equals [initial]: the
+ *   controller may only climb back toward what the host asked for.
+ * @param min Lower bound for decreases (bps).
+ */
+internal class AdaptiveBitrate(
+    initial: Int,
+    val max: Int,
+    val min: Int = 500_000,
+) {
+    companion object {
+        /** Minimum ticks between two bitrate decreases. */
+        const val DOWN_COOLDOWN_TICKS = 2
+        /** Minimum ticks between two bitrate increases. */
+        const val UP_INTERVAL_TICKS = 5
+        /**
+         * Backlog (bytes) considered congested: ¾ of the desktop's 512 KB
+         * StreamWriter HighWaterMark — react before the phone starts dropping.
+         */
+        const val HIGH_THRESHOLD_BYTES = 393_216L
+        /** Backlog (bytes) considered comfortable enough to try recovering. */
+        const val LOW_THRESHOLD_BYTES = 65_536L
+    }
+
+    /** Most recent bitrate decision, visible for tests and logs. */
+    var currentBitrate: Int = initial.coerceIn(min, max)
+        private set
+
+    private var ticks = 0
+    private var lastDecreaseTick = Int.MIN_VALUE / 2
+    private var lastIncreaseTick = Int.MIN_VALUE / 2
+
+    /**
+     * Feed one desktop stats report.
+     *
+     * @return the new bitrate (bps) if this tick changed it, null to hold.
+     */
+    fun onStats(backlogBytes: Long, paused: Boolean): Int? {
+        ticks++
+        val target = if (paused || backlogBytes >= HIGH_THRESHOLD_BYTES) {
+            // Congested: cut 30%, respecting the decrease cooldown.
+            if (ticks - lastDecreaseTick < DOWN_COOLDOWN_TICKS) return null
+            maxOf(min, currentBitrate * 7 / 10)
+        } else if (backlogBytes <= LOW_THRESHOLD_BYTES) {
+            // Comfortable: grow 10%, but slowly.
+            if (ticks - lastIncreaseTick < UP_INTERVAL_TICKS) return null
+            minOf(max, currentBitrate * 11 / 10)
+        } else {
+            // Dead zone: hold.
+            return null
+        }
+        if (target == currentBitrate) return null // clamped at the floor/ceiling
+        val previous = currentBitrate
+        currentBitrate = target
+        if (target < previous) {
+            lastDecreaseTick = ticks
+        } else {
+            lastIncreaseTick = ticks
+        }
+        return target
     }
 }
 

@@ -23,6 +23,8 @@ object CameraProtocol {
     const val PACKET_TYPE_CAMERA_STREAM = "kdeconnect.camera.stream" // android -> desktop (carries the H.264 payload)
     const val PACKET_TYPE_CAMERA_STOP = "kdeconnect.camera.stop"     // desktop -> android
     const val PACKET_TYPE_CAMERA_ERROR = "kdeconnect.camera.error"   // android -> desktop
+    /** desktop -> android congestion feedback (write-queue backlog + drain paused), no payload */
+    const val PACKET_TYPE_CAMERA_STATS = "kdeconnect.camera.stats"
 
     // Body keys
     const val KEY_CAMERAS = "cameras"
@@ -37,6 +39,10 @@ object CameraProtocol {
     const val KEY_ROTATION = "rotation"
     const val KEY_AUDIO = "audio"
     const val KEY_ERROR = "error"
+    // kdeconnect.camera.stats body keys (droppedChunks is Android-local and never
+    // travels on the wire)
+    const val KEY_BACKLOG_BYTES = "backlogBytes"
+    const val KEY_PAUSED = "paused"
 
     // facing values
     const val FACING_FRONT = "front"

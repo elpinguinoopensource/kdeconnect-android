@@ -44,6 +44,7 @@ android {
         versionCode = 13513
         versionName = "1.35.13"
         proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     buildFeatures {
         viewBinding = true
@@ -322,6 +323,13 @@ dependencies {
     testImplementation(libs.jsonassert)
     testImplementation(libs.robolectric)
     testImplementation(libs.androidx.junit)
+
+    // Instrumented tests (run on a connected device/emulator)
+    androidTestImplementation(libs.junit)
+    androidTestImplementation(libs.androidx.junit)
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.rules)
+    androidTestImplementation(libs.mockk.android)
 
     // For device controls
     implementation(libs.reactive.streams)

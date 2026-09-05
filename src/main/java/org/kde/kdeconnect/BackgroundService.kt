@@ -32,6 +32,7 @@ import org.kde.kdeconnect.backends.BaseLinkProvider.ConnectionReceiver
 import org.kde.kdeconnect.backends.bluetooth.BluetoothLinkProvider
 import org.kde.kdeconnect.backends.lan.LanLinkProvider
 import org.kde.kdeconnect.helpers.NotificationHelper
+import org.kde.kdeconnect.plugins.camera.CameraNotificationFactory
 import org.kde.kdeconnect.plugins.clipboard.ClipboardFloatingActivity
 import org.kde.kdeconnect.plugins.clipboard.ClipboardPlugin
 import org.kde.kdeconnect.plugins.runcommand.RunCommandActivity
@@ -51,6 +52,8 @@ class BackgroundService : Service() {
     private lateinit var applicationInstance: KdeConnect
 
     private val linkProviders = mutableListOf<BaseLinkProvider>()
+
+    private var cameraNotificationActive = false
 
     /** Indicates whether device is connected over wifi / usb / bluetooth / (anything other than cellular) */
     val isConnectedToNonCellularNetwork: LiveData<Boolean>
@@ -236,6 +239,39 @@ class BackgroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(LOG_TAG, "onStartCommand")
+
+        val cameraActive = intent?.getBooleanExtra("cameraActive", false) == true
+        if (cameraActive) {
+            val deviceName = intent.getStringExtra("cameraDeviceName") ?: ""
+            val deviceId = intent.getStringExtra("deviceId") ?: ""
+            val notif = CameraNotificationFactory.build(this, deviceName, deviceId)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                try {
+                    startForeground(
+                        FOREGROUND_NOTIFICATION_ID,
+                        notif,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                    )
+                } catch (e: Exception) {
+                    Log.w("BackgroundService", "Couldn't startForeground with camera type", e)
+                }
+            } else {
+                startForeground(FOREGROUND_NOTIFICATION_ID, notif)
+            }
+            cameraNotificationActive = true
+            return START_STICKY
+        }
+
+        // Demote: camera was active, now it's not
+        if (cameraNotificationActive) {
+            cameraNotificationActive = false
+            if (!NotificationHelper.isPersistentNotificationEnabled(this)) {
+                @Suppress("DEPRECATION") // stopForeground(int) is API 24; minSdk is 23
+                stopForeground(true)
+            }
+            // Fall through to re-show persistent notification if enabled
+        }
+
         if (NotificationHelper.isPersistentNotificationEnabled(this)) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 try {
@@ -259,7 +295,7 @@ class BackgroundService : Service() {
         const val LOG_TAG = "KDE/BackgroundService"
 
         const val UPDATE_IMMUTABLE_FLAGS = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        private const val FOREGROUND_NOTIFICATION_ID = 1
+        internal const val FOREGROUND_NOTIFICATION_ID = 1
 
         @JvmStatic
         var instance: BackgroundService? = null
